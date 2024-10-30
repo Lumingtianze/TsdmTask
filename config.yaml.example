@@ -1,0 +1,8 @@
+account:
+  - name: Name1
+    cookie: cookie
+  - name: Name2
+    cookie: cookie
+push:
+  bot_token: Telegram Bot Token
+  chat_id: Telegram Chat ID
