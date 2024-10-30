@@ -1,8 +1,8 @@
 account:
   - name: Name1
-    cookie: cookie
+    cookie: s_gkr8_abcd_saltkey=********; s_gkr8_abcd_lastvisit=********; s_gkr8_abcd_auth=********; s_gkr8_abcd_connect_is_bind=0; s_gkr8_abcd_smile=4D1; s_gkr8_abcd_forum_lastvisit=********; s_gkr8_abcd_visitedfid=********; s_gkr8_abcd_sendmail=1; s_gkr8_abcd_checkpm=1; s_gkr8_abcd_ulastactivity=********; s_gkr8_abcd_sid=********; s_gkr8_abcd_lastact=******** 
   - name: Name2
-    cookie: cookie
+    cookie: s_gkr8_abcd_saltkey=********; s_gkr8_abcd_lastvisit=********; s_gkr8_abcd_auth=********; s_gkr8_abcd_connect_is_bind=0; s_gkr8_abcd_smile=4D1; s_gkr8_abcd_forum_lastvisit=********; s_gkr8_abcd_visitedfid=********; s_gkr8_abcd_sendmail=1; s_gkr8_abcd_checkpm=1; s_gkr8_abcd_ulastactivity=********; s_gkr8_abcd_sid=********; s_gkr8_abcd_lastact=******** 
 push:
   bot_token: Telegram Bot Token
   chat_id: Telegram Chat ID
