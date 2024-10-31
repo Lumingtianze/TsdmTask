@@ -318,17 +318,17 @@ func run(config *Config, daemonMode bool) {
 			os.Exit(0)
 		}
 
-		// 将标准输出和标准错误重定向到文件
-		logFile, err := os.OpenFile("tsdm.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+		//丢弃输出
+		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 		if err != nil {
-			fmt.Println("无法打开日志文件:", err)
+			fmt.Println("无法打开 /dev/null:", err)
 			return
 		}
-		defer logFile.Close()
+		defer devNull.Close()
 
-		os.Stdout = logFile
-		os.Stderr = logFile
-
+		os.Stdout = devNull
+		os.Stderr = devNull
+		
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
