@@ -1,0 +1,27 @@
+name: 自动签到打工
+on:
+  workflow_dispatch:
+  #schedule:
+  #  - cron: '0 0,6,12,18 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检查
+        uses: actions/checkout@main
+        
+      - name: 运行
+        run: |
+          wget https://github.com/Lumingtianze/TsdmTask/releases/latest/download/TsdmTask-linux-amd64
+          chmod +x ./TsdmTask-linux-amd64
+          ./TsdmTask-linux-amd64
+
+      - name: 删除 releases 与 workflows runs
+        uses: ophub/delete-releases-workflows@main
+        with:
+          delete_releases: false
+          releases_keep_latest: 0
+          delete_workflows: true
+          workflows_keep_day: 0
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
