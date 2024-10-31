@@ -179,7 +179,7 @@ func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 			return false, 0, fmt.Errorf("打工请求失败: %w", err)
 		}
 
-		<-time.After(3 * time.Second) // 接收通道并阻塞等待
+		time.Sleep(3 * time.Second)
 	}
 
 	// 获取奖励
@@ -332,76 +332,39 @@ func run(config *Config, daemonMode bool) {
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-		for {
-			var wg sync.WaitGroup
-			// 使用 goroutine 池限制并发数量
-			concurrencyLimit := 5 // 设置并发限制，可以根据实际情况调整
-			semaphore := make(chan struct{}, concurrencyLimit)
+		var wg sync.WaitGroup
+		wg.Add(len(config.Account) * 2) // 为每个账户的签到和打工任务添加计数
 
-			for _, account := range config.Account {
-				semaphore <- struct{}{} // 获取信号量
-				wg.Add(2)               // 每个账户启动两个 goroutine，一个用于签到，一个用于打工
-
-				// 后台模式下，每天凌晨 0 点执行一次签到
-				go func(acc struct {
-					Name   string `yaml:"name"`
-					Cookie string `yaml:"cookie"`
-				}) {
-					defer func() {
-						<-semaphore
-						wg.Done() // 将 wg.Done() 移到 defer 函数中
-					}()
-
-					// 计算到第二天凌晨的时间
+		for _, account := range config.Account {
+			// 后台模式下，每天凌晨 0 点执行一次签到
+			go func(acc struct {
+				Name   string `yaml:"name"`
+				Cookie string `yaml:"cookie"`
+			}) {
+				defer wg.Done() // 确保签到任务完成后计数器减一
+				for {
 					now := time.Now()
 					nextMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Add(24 * time.Hour)
+					time.Sleep(nextMidnight.Sub(now)) // 等待到第二天凌晨
+					runCheckIn(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+				}
+			}(account)
 
-					// 创建一个定时器，每天凌晨触发
-					ticker := time.NewTicker(nextMidnight.Sub(now))
+			// 打工逻辑保持不变
+			go func(acc struct {
+				Name   string `yaml:"name"`
+				Cookie string `yaml:"cookie"`
+			}) {
+				defer wg.Done() // 确保打工任务完成后计数器减一
+				for {
+					waitDuration := runWork(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+					time.Sleep(waitDuration)
+				}
+			}(account)
+		}
 
-					for {
-						<-ticker.C // 等待定时器触发
-						runCheckIn(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+		wg.Wait() // 等待所有签到和打工任务完成
 
-						// 停止旧的定时器
-						ticker.Stop()
-
-						// 重新计算下一次签到时间
-						now = time.Now()
-						nextMidnight = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Add(24 * time.Hour)
-
-						// 创建一个新的定时器
-						ticker = time.NewTicker(nextMidnight.Sub(now))
-					}
-				}(account)
-
-				// 打工逻辑保持不变
-				go func(acc struct {
-					Name   string `yaml:"name"`
-					Cookie string `yaml:"cookie"`
-				}) {
-					defer func() {
-						<-semaphore
-						wg.Done()
-					}()
-					for {
-						waitDuration := runWork(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
-						<-time.After(waitDuration)
-					}
-				}(account)
-			}
-
-			// wg.Wait()  // 移除 wg.Wait()
-
-			select {
-			case <-sigs:
-				fmt.Println("程序退出")
-				return
-			default:
-				// 使用 time.After 替代 time.Sleep
-				<-time.After(10 * time.Minute)
-			}
-		} // for 循环结束
 	} else {
 		for _, account := range config.Account {
 			runCheckIn(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
