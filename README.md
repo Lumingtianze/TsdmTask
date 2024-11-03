@@ -2,15 +2,17 @@
 
 **项目描述：**
 
-本项目是一个使用 Go 语言编写的自动化脚本，用于自动在天使动漫论坛（tsdm39.com）进行签到和打工任务，并通过 Telegram 机器人推送结果通知。绝大部分内容由gemini-1.5-pro-exp-0827模型完成。
+本项目是一个使用 Go 语言编写的自动化脚本，用于自动在天使动漫论坛（tsdm39.com）进行签到和打工以及自动抢红包任务，并通过 Telegram 机器人推送结果通知。绝大部分内容由gemini-1.5-pro-exp-0827模型完成。
 
 **功能：**
 
 1. **自动签到：** 每天凌晨 0 点自动执行签到。
 2. **自动打工：** 根据间隔时间定时执行打工任务。
-3. **Telegram 推送：** 将签到结果和打工结果推送到Telegram。
-4. **后台运行 (可选)：** 可以选择以守护进程的方式运行程序。
-5. **支持Github Ations定时执行**：支持Github Ations定时执行签到打工。
+3. **自动抢红包：** 自动抢红包（当前仅支持水区）。
+4. **Telegram 推送：** 将签到结果和打工结果以及抢红包结果推送到Telegram。
+5. **后台运行 (可选)：** 可以选择以守护进程的方式运行程序。
+6. **多账户：** 支持多账户执行任务。
+7. **支持Github Ations：** 支持Github Ations定时执行签到任务。
 
 **配置文件 (config.yaml)：**
 
@@ -36,6 +38,7 @@ push:
    go get github.com/yhat/scrape
    go get golang.org/x/net/html
    go get golang.org/x/net/html/charset
+   go get golang.org/x/sync/errgroup
    ```
 3. **编译程序：** 使用 `go build` 命令编译程序：
    ```bash

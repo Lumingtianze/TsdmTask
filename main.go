@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -16,11 +17,14 @@ import (
 	"time"
 
 	"github.com/go-yaml/yaml"
+	"github.com/mmcdole/gofeed"
 	"github.com/yhat/scrape"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
+	"golang.org/x/sync/errgroup"
 )
 
+// Config 定义配置文件结构体
 type Config struct {
 	Account []struct {
 		Name   string `yaml:"name"`
@@ -32,13 +36,27 @@ type Config struct {
 	} `yaml:"push"`
 }
 
+// httpClient 定义全局 HTTP 客户端
 var httpClient = &http.Client{
 	Timeout: 10 * time.Second,
 	Transport: &http.Transport{
-		MaxIdleConnsPerHost: 10, // 每个 Host 最大空闲连接数
+		MaxIdleConnsPerHost: 100, // 每个 Host 最大空闲连接数
 	},
 }
 
+// RedPacketCacheItem 定义红包缓存项结构体
+type RedPacketCacheItem struct {
+	TID         string
+	PublishedAt time.Time
+	AngelCoins  int
+	Result      string
+	Error       error
+}
+
+// redPacketCache 定义红包缓存
+var redPacketCache sync.Map
+
+// loadConfig 从配置文件加载配置
 func loadConfig(configPath string) (*Config, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -54,6 +72,7 @@ func loadConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
+// sendRequest 发送 HTTP 请求
 func sendRequest(method, url string, body string, headers map[string]string, cookie string) ([]byte, error) {
 	req, err := http.NewRequest(method, url, strings.NewReader(body))
 	if err != nil {
@@ -63,7 +82,6 @@ func sendRequest(method, url string, body string, headers map[string]string, coo
 	if cookie != "" {
 		req.Header.Set("Cookie", cookie)
 	}
-
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -74,14 +92,10 @@ func sendRequest(method, url string, body string, headers map[string]string, coo
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-
-	return data, nil
+	return io.ReadAll(resp.Body)
 }
 
+// tsdmCheckIn 执行天使动漫论坛签到
 func tsdmCheckIn(cookie string) (string, error) {
 	// 获取formhash
 	data, err := sendRequest("GET", "https://www.tsdm39.com/forum.php", "", nil, cookie)
@@ -112,7 +126,7 @@ func tsdmCheckIn(cookie string) (string, error) {
 	}
 
 	// 检查签到结果
-	successRegex := regexp.MustCompile(`签到成功`)
+	checkInSuccessRegex := regexp.MustCompile(`签到成功`)
 	alreadyRegex := regexp.MustCompile(`您今日已经签到`)
 
 	// 使用 html.Parse 解析 HTML 代码
@@ -136,8 +150,48 @@ func tsdmCheckIn(cookie string) (string, error) {
 	// 获取签到结果文本
 	resultText := strings.TrimSpace(scrape.Text(div))
 
-	if successRegex.MatchString(resultText) {
-		return "签到成功", nil
+	// 提取天使币奖励信息
+	angelCoinRegex := regexp.MustCompile(`天使币 (\d+)`)
+	angelCoinMatches := angelCoinRegex.FindAllStringSubmatch(resultText, -1)
+	var totalAngelCoins int
+	for _, match := range angelCoinMatches {
+		coins, _ := strconv.Atoi(match[1])
+		totalAngelCoins += coins
+	}
+
+	// 提取额外奖励信息
+	extraRewardRegex := regexp.MustCompile(`额外奖励 天使币 (\d+)`)
+	extraRewardMatch := extraRewardRegex.FindStringSubmatch(resultText)
+	var extraReward int
+	if len(extraRewardMatch) > 1 {
+		extraReward, _ = strconv.Atoi(extraRewardMatch[1])
+	}
+
+	// 提取签到排名信息
+	rankingRegex := regexp.MustCompile(`您是今天第(\d+)个签到的会员`)
+	rankingMatch := rankingRegex.FindStringSubmatch(resultText)
+	var ranking int
+	if len(rankingMatch) > 1 {
+		ranking, _ = strconv.Atoi(rankingMatch[1])
+	} else {
+		// 如果没有匹配到排名信息，则将排名设置为 -1
+		ranking = -1
+	}
+
+	if checkInSuccessRegex.MatchString(resultText) {
+		if extraReward > 0 {
+			if ranking != -1 { // 如果有排名信息
+				return fmt.Sprintf("签到成功，您是今天第 %d 个签到的会员，获得天使币 %d (包含额外奖励 %d)", ranking, totalAngelCoins, extraReward), nil
+			} else { // 如果没有排名信息
+				return fmt.Sprintf("签到成功，获得天使币 %d (包含额外奖励 %d)", totalAngelCoins, extraReward), nil
+			}
+		} else {
+			if ranking != -1 { // 如果有排名信息
+				return fmt.Sprintf("签到成功，您是今天第 %d 个签到的会员，获得天使币 %d", ranking, totalAngelCoins), nil
+			} else { // 如果没有排名信息
+				return fmt.Sprintf("签到成功，获得天使币 %d", totalAngelCoins), nil
+			}
+		}
 	} else if alreadyRegex.MatchString(resultText) {
 		return "您今天已经签到", nil
 	} else {
@@ -145,6 +199,7 @@ func tsdmCheckIn(cookie string) (string, error) {
 	}
 }
 
+// tsdmWork 执行天使动漫论坛打工任务
 func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 	headers := map[string]string{
 		"User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -172,14 +227,15 @@ func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 
 	// 打工
 	formData := url.Values{"act": {"clickad"}}
+	ticker := time.NewTicker(3 * time.Second) // 使用 ticker 控制打工请求间隔
+	defer ticker.Stop()
 	for i := 0; i < 6; i++ {
+		<-ticker.C // 等待 ticker 事件
 		_, err := sendRequest("POST", "https://www.tsdm39.com/plugin.php?id=np_cliworkdz:work", formData.Encode(), headers, cookie)
 		if err != nil {
 			fmt.Printf("[%s] 打工请求失败: %v\n", accountName, err)
 			return false, 0, fmt.Errorf("打工请求失败: %w", err)
 		}
-
-		time.Sleep(3 * time.Second)
 	}
 
 	// 获取奖励
@@ -191,9 +247,10 @@ func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 	}
 
 	// 检查是否打工成功
-	successRegex := regexp.MustCompile(`恭喜，您已经成功领取了奖励天使币 \+\d+`)
-	if successRegex.MatchString(string(data)) {
+	workSuccessRegex := regexp.MustCompile(`恭喜，您已经成功领取了奖励天使币 \+\d+`)
+	if workSuccessRegex.MatchString(string(data)) {
 		fmt.Printf("[%s] 打工成功\n", accountName)
+
 		return true, 6 * time.Hour, nil // 打工成功后，返回 6 小时的等待时间
 	}
 
@@ -201,6 +258,7 @@ func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 	return false, 0, fmt.Errorf("打工失败: %s", string(data))
 }
 
+// getScore 获取用户天使币数量
 func getScore(cookie string) (string, error) {
 	data, err := sendRequest("GET", "https://www.tsdm39.com/home.php?mod=spacecp&ac=credit&showcredit=1", "", nil, cookie)
 	if err != nil {
@@ -233,6 +291,94 @@ func getScore(cookie string) (string, error) {
 	return angelCoins, nil
 }
 
+// grabRedPacket 尝试抢红包
+func grabRedPacket(tid string, cookie string) (int, string, error) {
+	redPacketURL := fmt.Sprintf("https://tsdm39.com/plugin.php?id=tsdmbet:awardPacket&action=getaward&tid=%s", tid)
+
+	// 发送红包请求
+	respData, err := sendRequest("GET", redPacketURL, "", nil, cookie)
+	if err != nil {
+		return 0, "", fmt.Errorf("红包请求失败: %w", err)
+	}
+
+	// 检查红包结果
+	redPacketSuccessRegex := regexp.MustCompile(`获得 (\d+) 天使币`)
+	redPacketFailRegex := regexp.MustCompile(`来晚了`)
+	redPacketAlreadyRegex := regexp.MustCompile(`已经领取过这个主题的红包了`)
+	redPacketNoRedPacketRegex := regexp.MustCompile(`这个主题并没有红包`)
+
+	if redPacketSuccessRegex.MatchString(string(respData)) {
+		matches := redPacketSuccessRegex.FindStringSubmatch(string(respData))
+		redPacketAngelCoins, _ := strconv.Atoi(matches[1])
+		return redPacketAngelCoins, fmt.Sprintf("抢到红包啦！获得 %d 天使币", redPacketAngelCoins), nil
+	} else if redPacketFailRegex.MatchString(string(respData)) {
+		return 0, "来晚了，红包已被抢光", nil
+	} else if redPacketAlreadyRegex.MatchString(string(respData)) {
+		return 0, "您已领取过此红包", nil
+	} else if redPacketNoRedPacketRegex.MatchString(string(respData)) {
+		return 0, "这个主题并没有红包", nil
+	} else {
+		return 0, "", fmt.Errorf("未知错误: %s", string(respData))
+	}
+}
+
+// checkRSS 检查 RSS 订阅并尝试抢红包
+func checkRSS(cookie, botToken, chatID string) {
+	fp := gofeed.NewParser()
+	feed, err := fp.ParseURL("https://tsdm39.com/forum.php?mod=rss&fid=4&auth=0")
+	if err != nil {
+		fmt.Println("解析 RSS 订阅失败:", err)
+		return
+	}
+
+	for _, item := range feed.Items {
+		tidRegex := regexp.MustCompile(`tid=(\d+)`)
+		tidMatches := tidRegex.FindStringSubmatch(item.Link)
+		if len(tidMatches) > 1 {
+			tid := tidMatches[1]
+
+			// 检查缓存
+			if cacheItem, ok := redPacketCache.Load(tid); ok {
+				if time.Since(cacheItem.(RedPacketCacheItem).PublishedAt) < 7*24*time.Hour {
+					// 缓存未过期，直接使用缓存结果
+					angelCoins := cacheItem.(RedPacketCacheItem).AngelCoins
+					result := cacheItem.(RedPacketCacheItem).Result
+					err := cacheItem.(RedPacketCacheItem).Error
+					if err != nil {
+						fmt.Println("抢红包失败 (缓存):", err)
+					} else if angelCoins > 0 { // 只在抢到红包时推送
+						fmt.Println(result)
+						push(result, botToken, chatID)
+					}
+					continue // 跳过当前帖子
+				} else {
+					// 缓存过期，删除缓存项
+					redPacketCache.Delete(tid)
+				}
+			}
+
+			// 缓存过期或不存在，尝试抢红包
+			redPacketAngelCoins, redPacketResult, err := grabRedPacket(tid, cookie)
+			if err != nil {
+				fmt.Println("抢红包失败:", err)
+			} else if redPacketAngelCoins > 0 { // 只在抢到红包时输出和推送
+				fmt.Println(redPacketResult)
+				push(redPacketResult, botToken, chatID)
+			}
+
+			// 更新缓存
+			redPacketCache.Store(tid, RedPacketCacheItem{
+				TID:         tid,
+				PublishedAt: item.PublishedParsed.UTC(),
+				AngelCoins:  redPacketAngelCoins,
+				Result:      redPacketResult,
+				Error:       err,
+			})
+		}
+	}
+}
+
+// telegramPush 发送 Telegram 推送消息
 func telegramPush(sendTitle, pushMessage, botToken, chatID string) error {
 	formData := url.Values{
 		"chat_id": {chatID},
@@ -250,6 +396,7 @@ func telegramPush(sendTitle, pushMessage, botToken, chatID string) error {
 	return nil
 }
 
+// push 发送推送消息
 func push(data, botToken, chatID string) {
 	err := telegramPush("【天使动漫论坛任务推送】", data, botToken, chatID)
 	if err != nil {
@@ -257,18 +404,23 @@ func push(data, botToken, chatID string) {
 	}
 }
 
+// pushCheckInResult 推送签到结果
 func pushCheckInResult(accountName, result, botToken, chatID string) {
-	if strings.Contains(result, "签到成功") {
+	// 只在签到成功时推送消息
+	checkInSuccessRegex := regexp.MustCompile(`签到成功`)
+	if checkInSuccessRegex.MatchString(result) {
 		push(fmt.Sprintf("[%s] 签到结果: %s", accountName, result), botToken, chatID)
 	}
 }
 
+// pushWorkResult 推送打工结果
 func pushWorkResult(accountName string, success bool, score, botToken, chatID string) {
 	if success {
 		push(fmt.Sprintf("[%s] 打工成功，已拥有天使币数量: %s", accountName, score), botToken, chatID)
 	}
 }
 
+// runCheckIn 运行签到任务
 func runCheckIn(accountName, cookie, botToken, chatID string) {
 	checkInResult, err := tsdmCheckIn(cookie)
 	if err != nil {
@@ -279,6 +431,7 @@ func runCheckIn(accountName, cookie, botToken, chatID string) {
 	}
 }
 
+// runWork 运行打工任务
 func runWork(accountName, cookie, botToken, chatID string) time.Duration {
 	workSuccess, waitDuration, err := tsdmWork(accountName, cookie)
 	if err != nil {
@@ -304,9 +457,12 @@ func runWork(accountName, cookie, botToken, chatID string) time.Duration {
 	return waitDuration
 }
 
+// run 运行程序
 func run(config *Config, daemonMode bool) {
 	if daemonMode {
+		// 守护进程模式
 		if os.Getppid() != 1 {
+			// 创建子进程并退出父进程
 			pid, err := syscall.ForkExec(os.Args[0], os.Args, &syscall.ProcAttr{
 				Files: []uintptr{os.Stdin.Fd(), os.Stdout.Fd(), os.Stderr.Fd()},
 			})
@@ -328,47 +484,177 @@ func run(config *Config, daemonMode bool) {
 
 		os.Stdout = devNull
 		os.Stderr = devNull
-		
+
+		// 捕获信号
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-		var wg sync.WaitGroup
-		wg.Add(len(config.Account) * 2) // 为每个账户的签到和打工任务添加计数
+		// 创建 context
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// 使用 errgroup 管理并发任务
+		group, ctx := errgroup.WithContext(ctx)
 
 		for _, account := range config.Account {
-			// 后台模式下，每天凌晨 0 点执行一次签到
-			go func(acc struct {
-				Name   string `yaml:"name"`
-				Cookie string `yaml:"cookie"`
-			}) {
-				defer wg.Done() // 确保签到任务完成后计数器减一
-				for {
-					now := time.Now()
-					nextMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).Add(24 * time.Hour)
-					time.Sleep(nextMidnight.Sub(now)) // 等待到第二天凌晨
-					runCheckIn(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
-				}
-			}(account)
+			acc := account // 避免闭包陷阱
 
-			// 打工逻辑保持不变
-			go func(acc struct {
-				Name   string `yaml:"name"`
-				Cookie string `yaml:"cookie"`
-			}) {
-				defer wg.Done() // 确保打工任务完成后计数器减一
-				for {
-					waitDuration := runWork(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
-					time.Sleep(waitDuration)
+			// --- 签到任务 ---
+			group.Go(func() error {
+				// 在 -d 模式下，先执行一次签到任务
+				checkInResult, err := tsdmCheckIn(acc.Cookie)
+				if err == nil {
+					fmt.Printf("[%s] %s\n", acc.Name, checkInResult)
+					pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
+				} else {
+					// 记录错误日志
+					fmt.Printf("[%s] 签到失败: %v\n", acc.Name, err)
 				}
-			}(account)
+				// 创建 UTC+8 时区
+				location := time.FixedZone("UTC+8", 8*3600)
+
+				for {
+					now := time.Now().In(location)                                                 // 获取 UTC+8 时间
+					nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location) // 使用 UTC+8 时间计算 0:0:0
+
+					if now.After(nextRun) {
+						nextRun = nextRun.Add(24 * time.Hour) // 计算第二天的签到时间（UTC+8）
+					}
+
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(time.Until(nextRun)):
+					}
+
+					// 最大重试次数和初始重试间隔
+					maxRetry := 100
+					retryInterval := time.Minute
+
+				RetryLoop: // 添加标签
+					for retryCount := 0; retryCount < maxRetry; retryCount++ {
+						success := make(chan struct{})
+						errChan := make(chan error, 30)
+						timeout := 30 * time.Second
+
+						for i := 0; i < 30; i++ {
+							go func() {
+								select {
+								case <-success:
+									return
+								default:
+									checkInResult, err := tsdmCheckIn(acc.Cookie)
+									if err != nil {
+										errChan <- err
+										return
+									} else {
+										fmt.Printf("[%s] %s\n", acc.Name, checkInResult)
+										pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
+										close(success)
+										return
+									}
+								}
+							}()
+							time.Sleep(time.Second)
+						}
+
+						select {
+						case <-success:
+							retryInterval = time.Minute // 重置重试间隔
+							break RetryLoop             // 跳出 RetryLoop 循环
+						case err := <-errChan:
+							fmt.Printf("[%s] 30 秒内签到失败: %v\n", acc.Name, err)
+
+							if strings.Contains(err.Error(), "network error") ||
+								strings.Contains(err.Error(), "connection refused") { // 根据实际错误信息修改
+
+								fmt.Printf("[%s] 网络错误，%d 秒后重试\n", acc.Name, retryInterval/time.Second)
+								select {
+								case <-ctx.Done():
+									return ctx.Err()
+								case <-time.After(retryInterval):
+									retryInterval *= 2
+									if retryInterval > time.Hour {
+										retryInterval = time.Hour // 最大重试间隔为 1 小时
+									}
+								}
+							} else {
+								fmt.Printf("[%s] 非网络错误，停止重试: %v\n", acc.Name, err)
+								return err // 非网络错误，停止重试
+							}
+
+						case <-time.After(timeout):
+							fmt.Printf("[%s] 签到超时\n", acc.Name)
+							// 根据你的需求选择 break 或 continue
+							// break RetryLoop  // 超时后停止重试，进入下一天
+							continue // 超时后继续重试
+
+						}
+					}
+
+					if maxRetry > 0 {
+						fmt.Printf("[%s] 签到失败，超过最大重试次数\n", acc.Name)
+					}
+				}
+
+			})
+
+			// --- 打工任务 ---
+			group.Go(func() error {
+				for {
+					select {
+					case <-ctx.Done():
+						return nil // 退出循环
+					default:
+						waitDuration := runWork(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+						if waitDuration == 0 {
+							waitDuration = 1 * time.Minute // 设置最小等待时间
+						}
+						timer := time.NewTimer(waitDuration) // 使用 timer 等待下次打工时间
+						select {
+						case <-ctx.Done():
+							timer.Stop()
+							return nil // 退出循环
+						case <-timer.C:
+							// 继续打工逻辑
+						}
+					}
+				}
+			})
+			// --- 抢红包任务 ---
+			group.Go(func() error {
+				ticker := time.NewTicker(15 * time.Minute)
+				defer ticker.Stop()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-ticker.C:
+						checkRSS(acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+					}
+				}
+			})
+
 		}
 
-		wg.Wait() // 等待所有签到和打工任务完成
+		// 等待信号并取消 context
+		go func() {
+			<-sigs
+			cancel()
+		}()
+
+		// 等待所有任务完成
+		if err := group.Wait(); err != nil && err != context.Canceled {
+			fmt.Println("并发任务出错:", err)
+		}
 
 	} else {
+		// 非守护进程模式
 		for _, account := range config.Account {
 			runCheckIn(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
 			runWork(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
+			checkRSS(account.Cookie, config.Push.BotToken, config.Push.ChatID)
 		}
 	}
 }
