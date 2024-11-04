@@ -34,9 +34,9 @@ push:
 1. **安装 Go 语言环境：** 确保你的系统已安装 Go 语言环境。
 2. **获取依赖库：** 使用 `go get` 命令安装所需的依赖库：
    ```bash
+   go get github.com/PuerkitoBio/goquery
    go get github.com/go-yaml/yaml
-   go get github.com/yhat/scrape
-   go get golang.org/x/net/html
+   go get github.com/mmcdole/gofeed
    go get golang.org/x/net/html/charset
    go get golang.org/x/sync/errgroup
    ```

@@ -16,10 +16,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/PuerkitoBio/goquery"
 	"github.com/go-yaml/yaml"
 	"github.com/mmcdole/gofeed"
-	"github.com/yhat/scrape"
-	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/sync/errgroup"
 )
@@ -129,26 +128,19 @@ func tsdmCheckIn(cookie string) (string, error) {
 	checkInSuccessRegex := regexp.MustCompile(`签到成功`)
 	alreadyRegex := regexp.MustCompile(`您今日已经签到`)
 
-	// 使用 html.Parse 解析 HTML 代码
+	// 使用 goquery 解析 HTML 代码
 	reader, err := charset.NewReader(strings.NewReader(string(respData)), http.DetectContentType(respData))
 	if err != nil {
 		return "", fmt.Errorf("创建 reader 失败: %w", err)
 	}
 
-	root, err := html.Parse(reader)
+	doc, err := goquery.NewDocumentFromReader(reader)
 	if err != nil {
 		return "", fmt.Errorf("解析 HTML 失败: %w", err)
 	}
 
 	// 查找包含签到结果的 div 元素
-	divMatcher := scrape.ByClass("c")
-	div, ok := scrape.Find(root, divMatcher)
-	if !ok {
-		return "", fmt.Errorf("找不到包含签到结果的 div 元素")
-	}
-
-	// 获取签到结果文本
-	resultText := strings.TrimSpace(scrape.Text(div))
+	resultText := doc.Find(".c").First().Text()
 
 	// 提取天使币奖励信息
 	angelCoinRegex := regexp.MustCompile(`天使币 (\d+)`)
@@ -265,29 +257,21 @@ func getScore(cookie string) (string, error) {
 		return "", fmt.Errorf("获取积分信息失败: %w", err)
 	}
 
+	// 使用 goquery 解析 HTML 代码
 	reader, err := charset.NewReader(strings.NewReader(string(data)), http.DetectContentType(data))
 	if err != nil {
 		return "", fmt.Errorf("创建 reader 失败: %w", err)
 	}
 
-	root, err := html.Parse(reader)
+	doc, err := goquery.NewDocumentFromReader(reader)
 	if err != nil {
 		return "", fmt.Errorf("解析 HTML 失败: %w", err)
 	}
 
-	ulMatcher := scrape.ByClass("creditl")
-	ul, ok := scrape.Find(root, ulMatcher)
-	if !ok {
-		return "", fmt.Errorf("找不到 ul 元素")
-	}
+	// 查找包含天使币数量的 li 元素
+	angelCoins := doc.Find(".creditl .xi1").First().Text()
+	angelCoins = strings.TrimSpace(strings.Replace(angelCoins, "天使币:", "", 1))
 
-	liMatcher := scrape.ByClass("xi1")
-	li, ok := scrape.Find(ul, liMatcher)
-	if !ok {
-		return "", fmt.Errorf("找不到 li 元素")
-	}
-
-	angelCoins := strings.TrimSpace(strings.Replace(scrape.Text(li), "天使币:", "", 1))
 	return angelCoins, nil
 }
 
