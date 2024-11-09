@@ -18,7 +18,6 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/go-yaml/yaml"
-	"github.com/mmcdole/gofeed"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/sync/errgroup"
 )
@@ -286,7 +285,7 @@ func grabRedPacket(tid string, cookie string) (int, string, error) {
 	}
 
 	// 检查红包结果
-	redPacketSuccessRegex := regexp.MustCompile(`获得 (\d+) 天使币`)
+	redPacketSuccessRegex := regexp.MustCompile(`已经领取 (\d+) 天使币`)
 	redPacketFailRegex := regexp.MustCompile(`来晚了`)
 	redPacketAlreadyRegex := regexp.MustCompile(`已经领取过这个主题的红包了`)
 	redPacketNoRedPacketRegex := regexp.MustCompile(`这个主题并没有红包`)
@@ -306,18 +305,36 @@ func grabRedPacket(tid string, cookie string) (int, string, error) {
 	}
 }
 
-// checkRSS 检查 RSS 订阅并尝试抢红包
-func checkRSS(cookie, botToken, chatID string) {
-	fp := gofeed.NewParser()
-	feed, err := fp.ParseURL("https://tsdm39.com/forum.php?mod=rss&fid=4&auth=0")
+// checkPosts 检查帖子列表并尝试抢红包
+func checkPosts(cookie, botToken, chatID string) {
+	// 获取帖子列表页面
+	respData, err := sendRequest("GET", "https://www.tsdm39.com/forum.php?mod=forumdisplay&fid=4", "", nil, cookie)
 	if err != nil {
-		fmt.Println("解析 RSS 订阅失败:", err)
+		fmt.Println("获取帖子列表页面失败:", err)
 		return
 	}
 
-	for _, item := range feed.Items {
+	// 使用 goquery 解析 HTML 代码
+	reader, err := charset.NewReader(strings.NewReader(string(respData)), http.DetectContentType(respData))
+	if err != nil {
+		fmt.Println("创建 reader 失败:", err)
+		return
+	}
+
+	doc, err := goquery.NewDocumentFromReader(reader)
+	if err != nil {
+		fmt.Println("解析 HTML 失败:", err)
+		return
+	}
+
+	// 查找帖子列表
+	doc.Find("tbody[id^='normalthread_']").Each(func(i int, s *goquery.Selection) {
+		// 提取帖子链接
+		link, _ := s.Find("th.common a.xst").Attr("href")
+
+		// 提取帖子 ID
 		tidRegex := regexp.MustCompile(`tid=(\d+)`)
-		tidMatches := tidRegex.FindStringSubmatch(item.Link)
+		tidMatches := tidRegex.FindStringSubmatch(link)
 		if len(tidMatches) > 1 {
 			tid := tidMatches[1]
 
@@ -334,7 +351,7 @@ func checkRSS(cookie, botToken, chatID string) {
 						fmt.Println(result)
 						push(result, botToken, chatID)
 					}
-					continue // 跳过当前帖子
+					return // 跳过当前帖子
 				} else {
 					// 缓存过期，删除缓存项
 					redPacketCache.Delete(tid)
@@ -351,15 +368,32 @@ func checkRSS(cookie, botToken, chatID string) {
 			}
 
 			// 更新缓存
+			publishedAt := getPublishedAt(s)
+
 			redPacketCache.Store(tid, RedPacketCacheItem{
 				TID:         tid,
-				PublishedAt: item.PublishedParsed.UTC(),
+				PublishedAt: publishedAt,
 				AngelCoins:  redPacketAngelCoins,
 				Result:      redPacketResult,
 				Error:       err,
 			})
 		}
+	})
+}
+
+// getPublishedAt 获取帖子发布时间
+func getPublishedAt(s *goquery.Selection) time.Time {
+	timeStr := s.Find("td.by cite em span").Last().AttrOr("title", "") // 获取最后一个 span 元素的 title 属性
+	if timeStr == "" {
+		timeStr = s.Find("td.by cite em a").Text()
 	}
+	// 将时间字符串转换为 time.Time 类型
+	publishedAt, err := time.ParseInLocation("2006-1-2 15:04:05", timeStr, time.Local) // 使用更精确的时间格式
+	if err != nil {
+		fmt.Println("解析帖子发布时间失败:", err)
+		return time.Now() // 解析失败则返回当前时间
+	}
+	return publishedAt
 }
 
 // telegramPush 发送 Telegram 推送消息
@@ -420,7 +454,7 @@ func runWork(accountName, cookie, botToken, chatID string) time.Duration {
 	workSuccess, waitDuration, err := tsdmWork(accountName, cookie)
 	if err != nil {
 		fmt.Printf("[%s] 打工错误: %v\n", accountName, err)
-		push(fmt.Sprintf("[%s] 打工失败: %v", accountName, err), botToken, chatID) // 推送打工失败信息
+		//push(fmt.Sprintf("[%s] 打工失败: %v", accountName, err), botToken, chatID) // 推送打工失败信息
 	} else {
 		score, scoreErr := getScore(cookie)
 		if scoreErr != nil {
@@ -457,7 +491,7 @@ func run(config *Config, daemonMode bool) {
 			fmt.Printf("后台进程已启动，PID: %d\n", pid)
 			os.Exit(0)
 		}
-
+		
 		//丢弃输出
 		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 		if err != nil {
@@ -480,6 +514,13 @@ func run(config *Config, daemonMode bool) {
 		// 使用 errgroup 管理并发任务
 		group, ctx := errgroup.WithContext(ctx)
 
+		// 创建动态时区
+		location, err := time.LoadLocation("Asia/Shanghai")
+		if err != nil {
+			fmt.Println("无法加载时区:", err)
+			return
+		}
+
 		for _, account := range config.Account {
 			acc := account // 避免闭包陷阱
 
@@ -494,120 +535,74 @@ func run(config *Config, daemonMode bool) {
 					// 记录错误日志
 					fmt.Printf("[%s] 签到失败: %v\n", acc.Name, err)
 				}
-				// 创建 UTC+8 时区
-				location := time.FixedZone("UTC+8", 8*3600)
+
+				// 计算下一次运行时间（UTC+8）
+				now := time.Now().In(location)
+				nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+				if now.After(nextRun) {
+					nextRun = nextRun.AddDate(0, 0, 1)
+				}
+
+				ticker := time.NewTicker(time.Until(nextRun))
+
+				defer ticker.Stop()
+
+				maxRetryTimes := 100              // 最大重试次数
+				retryInterval := 15 * time.Minute // 重试间隔
 
 				for {
-					now := time.Now().In(location)                                                 // 获取 UTC+8 时间
-					nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location) // 使用 UTC+8 时间计算 0:0:0
-
-					if now.After(nextRun) {
-						nextRun = nextRun.Add(24 * time.Hour) // 计算第二天的签到时间（UTC+8）
-					}
-
 					select {
 					case <-ctx.Done():
 						return ctx.Err()
-					case <-time.After(time.Until(nextRun)):
-					}
-
-					// 最大重试次数和初始重试间隔
-					maxRetry := 100
-					retryInterval := time.Minute
-
-				RetryLoop: // 添加标签
-					for retryCount := 0; retryCount < maxRetry; retryCount++ {
-						success := make(chan struct{})
-						errChan := make(chan error, 30)
-						timeout := 30 * time.Second
-
-						for i := 0; i < 30; i++ {
-							go func() {
-								select {
-								case <-success:
-									return
-								default:
-									checkInResult, err := tsdmCheckIn(acc.Cookie)
-									if err != nil {
-										errChan <- err
-										return
-									} else {
-										fmt.Printf("[%s] %s\n", acc.Name, checkInResult)
-										pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
-										close(success)
-										return
+					case <-ticker.C:
+						// 执行签到
+						checkInResult, err := tsdmCheckIn(acc.Cookie)
+						if err != nil {
+							fmt.Printf("[%s] 签到错误: %v\n", acc.Name, err)
+							// 签到失败，进行重试
+							for i := 0; i < maxRetryTimes; i++ {
+								fmt.Printf("[%s] 开始第 %d 次重试...\n", acc.Name, i+1)
+								checkInResult, err := tsdmCheckIn(acc.Cookie)
+								if err != nil {
+									fmt.Printf("[%s] 重试签到错误: %v\n", acc.Name, err)
+									if i < maxRetryTimes-1 {
+										time.Sleep(retryInterval)
 									}
+								} else {
+									fmt.Printf("[%s] 重试签到成功: %s\n", acc.Name, checkInResult)
+									pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
+									break // 签到成功，退出重试循环
 								}
-							}()
-							time.Sleep(time.Second)
-						}
-
-						select {
-						case <-success:
-							retryInterval = time.Minute // 重置重试间隔
-							break RetryLoop             // 跳出 RetryLoop 循环
-						case err := <-errChan:
-							fmt.Printf("[%s] 30 秒内签到失败: %v\n", acc.Name, err)
-
-							if strings.Contains(err.Error(), "network error") ||
-								strings.Contains(err.Error(), "connection refused") { // 根据实际错误信息修改
-
-								fmt.Printf("[%s] 网络错误，%d 秒后重试\n", acc.Name, retryInterval/time.Second)
-								select {
-								case <-ctx.Done():
-									return ctx.Err()
-								case <-time.After(retryInterval):
-									retryInterval *= 2
-									if retryInterval > time.Hour {
-										retryInterval = time.Hour // 最大重试间隔为 1 小时
-									}
-								}
-							} else {
-								fmt.Printf("[%s] 非网络错误，停止重试: %v\n", acc.Name, err)
-								return err // 非网络错误，停止重试
 							}
-
-						case <-time.After(timeout):
-							fmt.Printf("[%s] 签到超时\n", acc.Name)
-							// 根据你的需求选择 break 或 continue
-							// break RetryLoop  // 超时后停止重试，进入下一天
-							continue // 超时后继续重试
-
+						} else {
+							fmt.Printf("[%s] 签到成功: %s\n", acc.Name, checkInResult)
+							pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
 						}
-					}
-
-					if maxRetry > 0 {
-						fmt.Printf("[%s] 签到失败，超过最大重试次数\n", acc.Name)
 					}
 				}
-
 			})
 
 			// --- 打工任务 ---
 			group.Go(func() error {
+				ticker := time.NewTicker(1 * time.Minute) // 设置初始的 ticker 间隔为 1 分钟
+				defer ticker.Stop()
 				for {
 					select {
 					case <-ctx.Done():
 						return nil // 退出循环
-					default:
+					case <-ticker.C:
 						waitDuration := runWork(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
 						if waitDuration == 0 {
 							waitDuration = 1 * time.Minute // 设置最小等待时间
 						}
-						timer := time.NewTimer(waitDuration) // 使用 timer 等待下次打工时间
-						select {
-						case <-ctx.Done():
-							timer.Stop()
-							return nil // 退出循环
-						case <-timer.C:
-							// 继续打工逻辑
-						}
+						ticker.Reset(waitDuration) // 重置 ticker 的间隔时间
 					}
 				}
 			})
+
 			// --- 抢红包任务 ---
 			group.Go(func() error {
-				ticker := time.NewTicker(15 * time.Minute)
+				ticker := time.NewTicker(5 * time.Minute)
 				defer ticker.Stop()
 
 				for {
@@ -615,7 +610,7 @@ func run(config *Config, daemonMode bool) {
 					case <-ctx.Done():
 						return nil
 					case <-ticker.C:
-						checkRSS(acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+						checkPosts(acc.Cookie, config.Push.BotToken, config.Push.ChatID)
 					}
 				}
 			})
@@ -638,7 +633,7 @@ func run(config *Config, daemonMode bool) {
 		for _, account := range config.Account {
 			runCheckIn(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
 			runWork(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
-			checkRSS(account.Cookie, config.Push.BotToken, config.Push.ChatID)
+			checkPosts(account.Cookie, config.Push.BotToken, config.Push.ChatID)
 		}
 	}
 }
