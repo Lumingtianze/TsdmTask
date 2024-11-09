@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/go-yaml/yaml"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
 )
 
 // Config 定义配置文件结构体
@@ -334,9 +334,6 @@ func checkPosts(accountName string, cookie string, botToken string, chatID strin
 		if err != nil {
 			// 不输出错误信息
 		} else {
-			// 处理抢红包结果，例如输出日志或推送消息
-			fmt.Printf("[%s] %s\n", accountName, redPacketResult)
-
 			// 如果抢到红包，推送消息
 			if redPacketAngelCoins > 0 {
 				push(fmt.Sprintf("[%s] %s", accountName, redPacketResult), botToken, chatID)
