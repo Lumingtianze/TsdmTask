@@ -42,17 +42,8 @@ var httpClient = &http.Client{
 	},
 }
 
-// RedPacketCacheItem 定义红包缓存项结构体
-type RedPacketCacheItem struct {
-	TID         string
-	PublishedAt time.Time
-	AngelCoins  int
-	Result      string
-	Error       error
-}
-
-// redPacketCache 定义红包缓存
-var redPacketCache sync.Map
+// accountPostCache 定义每个账户的帖子缓存
+var accountPostCache sync.Map // map[string]*sync.Map
 
 // loadConfig 从配置文件加载配置
 func loadConfig(configPath string) (*Config, error) {
@@ -274,39 +265,17 @@ func getScore(cookie string) (string, error) {
 	return angelCoins, nil
 }
 
-// grabRedPacket 尝试抢红包
-func grabRedPacket(tid string, cookie string) (int, string, error) {
-	redPacketURL := fmt.Sprintf("https://tsdm39.com/plugin.php?id=tsdmbet:awardPacket&action=getaward&tid=%s", tid)
-
-	// 发送红包请求
-	respData, err := sendRequest("GET", redPacketURL, "", nil, cookie)
-	if err != nil {
-		return 0, "", fmt.Errorf("红包请求失败: %w", err)
-	}
-
-	// 检查红包结果
-	redPacketSuccessRegex := regexp.MustCompile(`已经领取 (\d+) 天使币`)
-	redPacketFailRegex := regexp.MustCompile(`来晚了`)
-	redPacketAlreadyRegex := regexp.MustCompile(`已经领取过这个主题的红包了`)
-	redPacketNoRedPacketRegex := regexp.MustCompile(`这个主题并没有红包`)
-
-	if redPacketSuccessRegex.MatchString(string(respData)) {
-		matches := redPacketSuccessRegex.FindStringSubmatch(string(respData))
-		redPacketAngelCoins, _ := strconv.Atoi(matches[1])
-		return redPacketAngelCoins, fmt.Sprintf("抢到红包啦！获得 %d 天使币", redPacketAngelCoins), nil
-	} else if redPacketFailRegex.MatchString(string(respData)) {
-		return 0, "来晚了，红包已被抢光", nil
-	} else if redPacketAlreadyRegex.MatchString(string(respData)) {
-		return 0, "您已领取过此红包", nil
-	} else if redPacketNoRedPacketRegex.MatchString(string(respData)) {
-		return 0, "这个主题并没有红包", nil
-	} else {
-		return 0, "", fmt.Errorf("未知错误: %s", string(respData))
-	}
-}
-
 // checkPosts 检查帖子列表并尝试抢红包
-func checkPosts(cookie, botToken, chatID string) {
+func checkPosts(accountName string, cookie string, botToken string, chatID string) {
+	// 获取账户的缓存
+	var postCache *sync.Map
+	if cache, ok := accountPostCache.Load(accountName); ok {
+		postCache = cache.(*sync.Map)
+	} else {
+		postCache = &sync.Map{}
+		accountPostCache.Store(accountName, postCache)
+	}
+
 	// 获取帖子列表页面
 	respData, err := sendRequest("GET", "https://www.tsdm39.com/forum.php?mod=forumdisplay&fid=4", "", nil, cookie)
 	if err != nil {
@@ -330,70 +299,87 @@ func checkPosts(cookie, botToken, chatID string) {
 	// 查找帖子列表
 	doc.Find("tbody[id^='normalthread_']").Each(func(i int, s *goquery.Selection) {
 		// 提取帖子链接
-		link, _ := s.Find("th.common a.xst").Attr("href")
+		link, exists := s.Find("th a.xst").Attr("href")
+		if !exists {
+			fmt.Println("帖子链接不存在")
+			return
+		}
 
 		// 提取帖子 ID
 		tidRegex := regexp.MustCompile(`tid=(\d+)`)
 		tidMatches := tidRegex.FindStringSubmatch(link)
-		if len(tidMatches) > 1 {
-			tid := tidMatches[1]
-
-			// 检查缓存
-			if cacheItem, ok := redPacketCache.Load(tid); ok {
-				if time.Since(cacheItem.(RedPacketCacheItem).PublishedAt) < 7*24*time.Hour {
-					// 缓存未过期，直接使用缓存结果
-					angelCoins := cacheItem.(RedPacketCacheItem).AngelCoins
-					result := cacheItem.(RedPacketCacheItem).Result
-					err := cacheItem.(RedPacketCacheItem).Error
-					if err != nil {
-						fmt.Println("抢红包失败 (缓存):", err)
-					} else if angelCoins > 0 { // 只在抢到红包时推送
-						fmt.Println(result)
-						push(result, botToken, chatID)
-					}
-					return // 跳过当前帖子
-				} else {
-					// 缓存过期，删除缓存项
-					redPacketCache.Delete(tid)
-				}
-			}
-
-			// 缓存过期或不存在，尝试抢红包
-			redPacketAngelCoins, redPacketResult, err := grabRedPacket(tid, cookie)
-			if err != nil {
-				fmt.Println("抢红包失败:", err)
-			} else if redPacketAngelCoins > 0 { // 只在抢到红包时输出和推送
-				fmt.Println(redPacketResult)
-				push(redPacketResult, botToken, chatID)
-			}
-
-			// 更新缓存
-			publishedAt := getPublishedAt(s)
-
-			redPacketCache.Store(tid, RedPacketCacheItem{
-				TID:         tid,
-				PublishedAt: publishedAt,
-				AngelCoins:  redPacketAngelCoins,
-				Result:      redPacketResult,
-				Error:       err,
-			})
+		if len(tidMatches) <= 1 {
+			fmt.Println("帖子 ID 不存在")
+			return
 		}
+		tid := tidMatches[1]
+
+		// 检查缓存
+		if cached, ok := postCache.Load(tid); ok {
+			// 缓存存在，检查缓存创建时间是否超过 3 天
+			if time.Since(cached.(time.Time)) > 3*24*time.Hour {
+				// 缓存创建时间超过 3 天，刷新缓存时间，延长至 7 天
+				postCache.Store(tid, time.Now())
+				time.AfterFunc(7*24*time.Hour, func() {
+					postCache.Delete(tid)
+				})
+				return
+			} else {
+				// 缓存创建时间未超过 3 天，不做任何操作
+				return
+			}
+		}
+		// 缓存不存在或已过期，尝试抢红包
+		redPacketAngelCoins, redPacketResult, err := grabRedPacket(tid, cookie)
+		if err != nil {
+			// 不输出错误信息
+		} else {
+			// 处理抢红包结果，例如输出日志或推送消息
+			fmt.Printf("[%s] %s\n", accountName, redPacketResult)
+
+			// 如果抢到红包，推送消息
+			if redPacketAngelCoins > 0 {
+				push(fmt.Sprintf("[%s] %s", accountName, redPacketResult), botToken, chatID)
+			}
+		}
+
+		// 更新缓存并设置过期时间为 7 天
+		postCache.Store(tid, time.Now())
+		time.AfterFunc(7*24*time.Hour, func() {
+			postCache.Delete(tid)
+		})
 	})
 }
 
-// getPublishedAt 获取帖子发布时间
-func getPublishedAt(s *goquery.Selection) time.Time {
-	timeStr := s.Find("td.by cite em span").Last().AttrOr("title", "") // 获取最后一个 span 元素的 title 属性
-	if timeStr == "" {
-		timeStr = s.Find("td.by cite em a").Text()
-	}
-	// 将时间字符串转换为 time.Time 类型
-	publishedAt, err := time.ParseInLocation("2006-1-2 15:04:05", timeStr, time.Local) // 使用更精确的时间格式
+// grabRedPacket 尝试抢红包
+func grabRedPacket(tid string, cookie string) (int, string, error) {
+	redPacketURL := fmt.Sprintf("https://tsdm39.com/plugin.php?id=tsdmbet:awardPacket&action=getaward&tid=%s", tid)
+
+	// 发送红包请求
+	respData, err := sendRequest("GET", redPacketURL, "", nil, cookie)
 	if err != nil {
-		fmt.Println("解析帖子发布时间失败:", err)
-		return time.Now() // 解析失败则返回当前时间
+		return 0, "", fmt.Errorf("红包请求失败: %w", err)
 	}
-	return publishedAt
+
+	// 检查红包结果
+	redPacketSuccessRegex := regexp.MustCompile(`领取红包 (\d+) 天使币`)
+	redPacketFailRegex := regexp.MustCompile(`来晚了`)
+	redPacketAlreadyRegex := regexp.MustCompile(`已经领取过这个主题的红包了`)
+	redPacketNoRedPacketRegex := regexp.MustCompile(`这个主题并没有红包`)
+
+	if redPacketSuccessRegex.MatchString(string(respData)) {
+		matches := redPacketSuccessRegex.FindStringSubmatch(string(respData))
+		redPacketAngelCoins, _ := strconv.Atoi(matches[1])
+		return redPacketAngelCoins, fmt.Sprintf("抢到红包啦！获得 %d 天使币", redPacketAngelCoins), nil
+	} else if redPacketFailRegex.MatchString(string(respData)) {
+		return 0, "来晚了，红包已被抢光", nil
+	} else if redPacketAlreadyRegex.MatchString(string(respData)) {
+		return 0, "您已领取过此红包", nil
+	} else if redPacketNoRedPacketRegex.MatchString(string(respData)) {
+		return 0, "这个主题并没有红包", nil
+	} else {
+		return 0, "", fmt.Errorf("未知错误: %s", string(respData))
+	}
 }
 
 // telegramPush 发送 Telegram 推送消息
@@ -491,7 +477,7 @@ func run(config *Config, daemonMode bool) {
 			fmt.Printf("后台进程已启动，PID: %d\n", pid)
 			os.Exit(0)
 		}
-		
+
 		//丢弃输出
 		devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 		if err != nil {
@@ -610,7 +596,7 @@ func run(config *Config, daemonMode bool) {
 					case <-ctx.Done():
 						return nil
 					case <-ticker.C:
-						checkPosts(acc.Cookie, config.Push.BotToken, config.Push.ChatID)
+						checkPosts(acc.Name, acc.Cookie, config.Push.BotToken, config.Push.ChatID)
 					}
 				}
 			})
@@ -633,7 +619,7 @@ func run(config *Config, daemonMode bool) {
 		for _, account := range config.Account {
 			runCheckIn(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
 			runWork(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
-			checkPosts(account.Cookie, config.Push.BotToken, config.Push.ChatID)
+			checkPosts(account.Name, account.Cookie, config.Push.BotToken, config.Push.ChatID)
 		}
 	}
 }
