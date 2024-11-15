@@ -4,8 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -17,6 +15,8 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/gabriel-vasile/mimetype"
+	"github.com/valyala/fasthttp"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
@@ -34,13 +34,15 @@ type Config struct {
 	} `yaml:"push"`
 }
 
-// httpClient 定义全局 HTTP 客户端
-var httpClient = &http.Client{
-	Timeout: 10 * time.Second,
-	Transport: &http.Transport{
-		MaxIdleConnsPerHost: 100, // 每个 Host 最大空闲连接数
-	},
+// httpClient 定义全局 HTTP 客户端 (使用 fasthttp)
+var httpClient = &fasthttp.Client{
+	MaxConnsPerHost:     200,
+	MaxIdleConnDuration: 30 * time.Second,
+	MaxConnDuration:     5 * time.Minute,
 }
+
+// 存储每个账户的 formhash，key 为 cookie，value 为 formhash
+var formhashCache sync.Map
 
 // accountPostCache 定义每个账户的帖子缓存
 var accountPostCache sync.Map // map[string]*sync.Map
@@ -63,10 +65,13 @@ func loadConfig(configPath string) (*Config, error) {
 
 // sendRequest 发送 HTTP 请求
 func sendRequest(method, url string, body string, headers map[string]string, cookie string) ([]byte, error) {
-	req, err := http.NewRequest(method, url, strings.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %w", err)
-	}
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(url)
+	req.Header.SetMethod(method)
 
 	if cookie != "" {
 		req.Header.Set("Cookie", cookie)
@@ -75,26 +80,79 @@ func sendRequest(method, url string, body string, headers map[string]string, coo
 		req.Header.Set(k, v)
 	}
 
-	resp, err := httpClient.Do(req)
+	if method == "POST" {
+		req.SetBodyString(body)
+	}
+
+	err := httpClient.Do(req, resp)
 	if err != nil {
 		return nil, fmt.Errorf("发送请求失败: %w", err)
 	}
-	defer resp.Body.Close()
 
-	return io.ReadAll(resp.Body)
+	return resp.Body(), nil
 }
 
 // tsdmCheckIn 执行天使动漫论坛签到
 func tsdmCheckIn(cookie string) (string, error) {
-	// 获取formhash
-	data, err := sendRequest("GET", "https://www.tsdm39.com/forum.php", "", nil, cookie)
-	if err != nil {
-		return "", fmt.Errorf("获取 formhash 失败: %w", err)
+	var formhash string
+	var ok bool
+	var retryCount int
+
+	// 尝试从缓存中获取 formhash
+	if cachedFormhash, loaded := formhashCache.Load(cookie); loaded {
+		if formhash, ok = cachedFormhash.(string); ok {
+			// 使用缓存的 formhash 进行签到操作，最多重试 3 次
+			for retryCount < 3 {
+				result, err := doCheckIn(cookie, formhash)
+				if err == nil {
+					return result, nil
+				}
+				retryCount++
+				fmt.Println("签到失败，重试次数:", retryCount)
+				time.Sleep(1 * time.Second) // 等待 1 秒后重试
+			}
+			// 重试 3 次后仍然失败，重新获取 formhash
+			fmt.Println("签到失败，重新获取 formhash")
+			formhashCache.Delete(cookie) // 删除缓存的 formhash
+		}
 	}
 
-	formhashRegex := regexp.MustCompile(`formhash=(.+?)"`)
-	formhash := formhashRegex.FindStringSubmatch(string(data))[1]
+	// 如果缓存中没有 formhash 或 formhash 过期，则发送请求获取
+	respData, err := sendRequest("GET", "https://www.tsdm39.com/forum.php", "", nil, cookie)
+	if err != nil {
+		return "", fmt.Errorf("获取页面内容失败: %w", err)
+	}
 
+	// 使用 goquery 解析 HTML 代码
+	contentType := mimetype.Detect(respData).String()
+	reader, err := charset.NewReader(strings.NewReader(string(respData)), contentType)
+	if err != nil {
+		return "", fmt.Errorf("创建 reader 失败: %w", err)
+	}
+
+	doc, err := goquery.NewDocumentFromReader(reader)
+	if err != nil {
+		return "", fmt.Errorf("解析 HTML 失败: %w", err)
+	}
+
+	// 提取 formhash
+	formhash, exists := doc.Find("input[name='formhash']").Attr("value")
+	if !exists {
+		return "", fmt.Errorf("formhash 不存在")
+	}
+
+	// 将 formhash 存储到缓存中，并设置过期时间
+	formhashCache.Store(cookie, formhash)
+	time.AfterFunc(30*24*time.Hour, func() {
+		formhashCache.Delete(cookie)
+	})
+
+	// 使用新获取的 formhash 进行签到操作
+	return doCheckIn(cookie, formhash)
+}
+
+// doCheckIn 使用指定的 formhash 执行签到操作
+func doCheckIn(cookie, formhash string) (string, error) {
 	// 签到
 	formData := url.Values{
 		"formhash":  {formhash},
@@ -119,7 +177,8 @@ func tsdmCheckIn(cookie string) (string, error) {
 	alreadyRegex := regexp.MustCompile(`您今日已经签到`)
 
 	// 使用 goquery 解析 HTML 代码
-	reader, err := charset.NewReader(strings.NewReader(string(respData)), http.DetectContentType(respData))
+	contentType := mimetype.Detect(respData).String()
+	reader, err := charset.NewReader(strings.NewReader(string(respData)), contentType)
 	if err != nil {
 		return "", fmt.Errorf("创建 reader 失败: %w", err)
 	}
@@ -242,13 +301,14 @@ func tsdmWork(accountName, cookie string) (bool, time.Duration, error) {
 
 // getScore 获取用户天使币数量
 func getScore(cookie string) (string, error) {
-	data, err := sendRequest("GET", "https://www.tsdm39.com/home.php?mod=spacecp&ac=credit&showcredit=1", "", nil, cookie)
+	respData, err := sendRequest("GET", "https://www.tsdm39.com/home.php?mod=spacecp&ac=credit&showcredit=1", "", nil, cookie)
 	if err != nil {
 		return "", fmt.Errorf("获取积分信息失败: %w", err)
 	}
 
-	// 使用 goquery 解析 HTML 代码
-	reader, err := charset.NewReader(strings.NewReader(string(data)), http.DetectContentType(data))
+	// 使用 mimetype 检测内容类型
+	contentType := mimetype.Detect(respData).String()
+	reader, err := charset.NewReader(strings.NewReader(string(respData)), contentType)
 	if err != nil {
 		return "", fmt.Errorf("创建 reader 失败: %w", err)
 	}
@@ -257,7 +317,6 @@ func getScore(cookie string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("解析 HTML 失败: %w", err)
 	}
-
 	// 查找包含天使币数量的 li 元素
 	angelCoins := doc.Find(".creditl .xi1").First().Text()
 	angelCoins = strings.TrimSpace(strings.Replace(angelCoins, "天使币:", "", 1))
@@ -284,7 +343,8 @@ func checkPosts(accountName string, cookie string, botToken string, chatID strin
 	}
 
 	// 使用 goquery 解析 HTML 代码
-	reader, err := charset.NewReader(strings.NewReader(string(respData)), http.DetectContentType(respData))
+	contentType := mimetype.Detect(respData).String()
+	reader, err := charset.NewReader(strings.NewReader(string(respData)), contentType)
 	if err != nil {
 		fmt.Println("创建 reader 失败:", err)
 		return
@@ -296,6 +356,8 @@ func checkPosts(accountName string, cookie string, botToken string, chatID strin
 		return
 	}
 
+	var wg sync.WaitGroup // 创建 WaitGroup
+
 	// 查找帖子列表
 	doc.Find("tbody[id^='normalthread_']").Each(func(i int, s *goquery.Selection) {
 		// 提取帖子链接
@@ -304,6 +366,8 @@ func checkPosts(accountName string, cookie string, botToken string, chatID strin
 			fmt.Println("帖子链接不存在")
 			return
 		}
+
+		wg.Add(1) // 为每个 goroutine 增加计数
 
 		// 提取帖子 ID
 		tidRegex := regexp.MustCompile(`tid=(\d+)`)
@@ -314,38 +378,43 @@ func checkPosts(accountName string, cookie string, botToken string, chatID strin
 		}
 		tid := tidMatches[1]
 
-		// 检查缓存
-		if cached, ok := postCache.Load(tid); ok {
-			// 缓存存在，检查缓存创建时间是否超过 3 天
-			if time.Since(cached.(time.Time)) > 3*24*time.Hour {
-				// 缓存创建时间超过 3 天，刷新缓存时间，延长至 7 天
-				postCache.Store(tid, time.Now())
-				time.AfterFunc(7*24*time.Hour, func() {
-					postCache.Delete(tid)
-				})
-				return
+		// 使用 goroutine 并行处理抢红包任务
+		go func(tid string) {
+			defer wg.Done() // 在 goroutine 结束时减少计数
+			// 检查缓存
+			if cached, ok := postCache.Load(tid); ok {
+				// 缓存存在，检查缓存创建时间是否超过 3 天
+				if time.Since(cached.(time.Time)) > 3*24*time.Hour {
+					// 缓存创建时间超过 3 天，刷新缓存时间，延长至 7 天
+					postCache.Store(tid, time.Now())
+					time.AfterFunc(7*24*time.Hour, func() {
+						postCache.Delete(tid)
+					})
+					return
+				} else {
+					// 缓存创建时间未超过 3 天，不做任何操作
+					return
+				}
+			}
+			// 缓存不存在或已过期，尝试抢红包
+			redPacketAngelCoins, redPacketResult, err := grabRedPacket(tid, cookie)
+			if err != nil {
+				// 不输出错误信息
 			} else {
-				// 缓存创建时间未超过 3 天，不做任何操作
-				return
+				// 如果抢到红包，推送消息
+				if redPacketAngelCoins > 0 {
+					push(fmt.Sprintf("[%s] %s", accountName, redPacketResult), botToken, chatID)
+				}
 			}
-		}
-		// 缓存不存在或已过期，尝试抢红包
-		redPacketAngelCoins, redPacketResult, err := grabRedPacket(tid, cookie)
-		if err != nil {
-			// 不输出错误信息
-		} else {
-			// 如果抢到红包，推送消息
-			if redPacketAngelCoins > 0 {
-				push(fmt.Sprintf("[%s] %s", accountName, redPacketResult), botToken, chatID)
-			}
-		}
 
-		// 更新缓存并设置过期时间为 7 天
-		postCache.Store(tid, time.Now())
-		time.AfterFunc(7*24*time.Hour, func() {
-			postCache.Delete(tid)
-		})
+			// 更新缓存并设置过期时间为 7 天
+			postCache.Store(tid, time.Now())
+			time.AfterFunc(7*24*time.Hour, func() {
+				postCache.Delete(tid)
+			})
+		}(tid)
 	})
+	wg.Wait() // 等待所有 goroutine 执行完毕
 }
 
 // grabRedPacket 尝试抢红包
@@ -399,10 +468,12 @@ func telegramPush(sendTitle, pushMessage, botToken, chatID string) error {
 
 // push 发送推送消息
 func push(data, botToken, chatID string) {
-	err := telegramPush("【天使动漫论坛任务推送】", data, botToken, chatID)
-	if err != nil {
-		fmt.Println(err)
-	}
+	go func() {
+		err := telegramPush("【天使动漫论坛任务推送】", data, botToken, chatID)
+		if err != nil {
+			fmt.Println(err)
+		}
+	}()
 }
 
 // pushCheckInResult 推送签到结果
@@ -519,9 +590,9 @@ func run(config *Config, daemonMode bool) {
 					fmt.Printf("[%s] 签到失败: %v\n", acc.Name, err)
 				}
 
-				// 计算下一次运行时间（UTC+8）
+				// 计算下一次运行时间（UTC+8），提前10秒
 				now := time.Now().In(location)
-				nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+				nextRun := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location).Add(-10 * time.Second)
 				if now.After(nextRun) {
 					nextRun = nextRun.AddDate(0, 0, 1)
 				}
@@ -538,9 +609,43 @@ func run(config *Config, daemonMode bool) {
 					case <-ctx.Done():
 						return ctx.Err()
 					case <-ticker.C:
-						// 执行签到
-						checkInResult, err := tsdmCheckIn(acc.Cookie)
-						if err != nil {
+						// 创建一个可取消的 context
+						childCtx, cancel := context.WithCancel(ctx)
+						defer cancel() // 确保 context 最终被取消
+
+						// 并发尝试签到
+						resultChan := make(chan string, 1) // 并发1次
+						errChan := make(chan error, 11)
+
+						for i := 0; i < 11; i++ {
+							go func() {
+								select {
+								case <-childCtx.Done():
+									return // context 已被取消，停止执行
+								default:
+									// 添加固定延迟
+									time.Sleep(time.Duration(i) * 1000 * time.Millisecond) // 每个 goroutine 延迟递增 1 秒
+									checkInResult, err := tsdmCheckIn(acc.Cookie)
+									if err != nil {
+										errChan <- err
+									} else {
+										// 只有签到成功才发送到 resultChan
+										if strings.Contains(checkInResult, "签到成功") {
+											resultChan <- checkInResult
+										}
+									}
+								}
+							}()
+						}
+
+						select {
+						case checkInResult := <-resultChan:
+							fmt.Printf("[%s] 签到成功: %s\n", acc.Name, checkInResult)
+							pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
+							cancel() // 签到成功，取消 context，通知其他 goroutine 停止执行
+							return nil
+
+						case err := <-errChan:
 							fmt.Printf("[%s] 签到错误: %v\n", acc.Name, err)
 							// 签到失败，进行重试
 							for i := 0; i < maxRetryTimes; i++ {
@@ -557,9 +662,6 @@ func run(config *Config, daemonMode bool) {
 									break // 签到成功，退出重试循环
 								}
 							}
-						} else {
-							fmt.Printf("[%s] 签到成功: %s\n", acc.Name, checkInResult)
-							pushCheckInResult(acc.Name, checkInResult, config.Push.BotToken, config.Push.ChatID)
 						}
 					}
 				}
