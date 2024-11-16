@@ -614,28 +614,39 @@ func run(config *Config, daemonMode bool) {
 						defer cancel() // 确保 context 最终被取消
 
 						// 并发尝试签到
-						resultChan := make(chan string, 1) // 并发1次
-						errChan := make(chan error, 11)
+						resultChan := make(chan string, 1)
+						errChan := make(chan error, 1)
 
-						for i := 0; i < 11; i++ {
-							go func() {
+						for i := 0; i < 101; i++ {
+							go func(index int) {
+								interval := time.Duration(index+1) * 100 * time.Millisecond // 延迟 0.1 秒
+
 								select {
 								case <-childCtx.Done():
-									return // context 已被取消，停止执行
-								default:
-									// 添加固定延迟
-									time.Sleep(time.Duration(i) * 1000 * time.Millisecond) // 每个 goroutine 延迟递增 1 秒
+									return
+								case <-time.After(interval):
 									checkInResult, err := tsdmCheckIn(acc.Cookie)
 									if err != nil {
-										errChan <- err
+										// 签到失败，尝试将错误发送到 errChan，如果 childCtx 已被取消，则直接返回
+										select {
+										case errChan <- err:
+										case <-childCtx.Done():
+											return
+										}
 									} else {
-										// 只有签到成功才发送到 resultChan
 										if strings.Contains(checkInResult, "签到成功") {
-											resultChan <- checkInResult
+											// 尝试将签到结果发送到 resultChan，如果 childCtx 已被取消，则直接返回
+											select {
+											case resultChan <- checkInResult:
+											case <-childCtx.Done():
+												return
+											}
+											return
 										}
 									}
+									return
 								}
-							}()
+							}(i)
 						}
 
 						select {
